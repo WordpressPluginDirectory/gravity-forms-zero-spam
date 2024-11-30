@@ -3,7 +3,7 @@
  * Plugin Name:       Gravity Forms Zero Spam
  * Plugin URI:        https://www.gravitykit.com?utm_source=plugin&utm_campaign=zero-spam&utm_content=pluginuri
  * Description:       Enhance Gravity Forms to include effective anti-spam measures—without using a CAPTCHA.
- * Version:           1.4.3
+ * Version:           1.4.5
  * Author:            GravityKit
  * Author URI:        https://www.gravitykit.com?utm_source=plugin&utm_campaign=zero-spam&utm_content=authoruri
  * License:           GPL-2.0+
@@ -88,7 +88,7 @@ class GF_Zero_Spam {
 		}
 
 		// Add the Zero Spam key to the partial entry if it's available in the POST data.
-		$submission['partial_entry']['gf_zero_spam_key'] = rgpost( 'gf_zero_spam_key' );;
+		$submission['partial_entry']['gf_zero_spam_key'] = rgpost( 'gf_zero_spam_key' );
 
 		return wp_json_encode( $submission );
 	}
@@ -136,19 +136,34 @@ class GF_Zero_Spam {
 
 		$form_id = (int) $form['id'];
 
-		$autocomplete = RGFormsModel::is_html5_enabled() ? ".attr( 'autocomplete', 'new-password' )\n\t\t" : '';
+		if ( version_compare( GFForms::$version, '2.9.0', '>=' ) ) {
+			$script = <<<EOD
+				gform.utils.addAsyncFilter('gform/submission/pre_submission', async (data) => {
+				    const input = document.createElement('input');
+				    input.type = 'hidden';
+				    input.name = 'gf_zero_spam_key';
+				    input.value = '{$spam_key}';
+				    input.setAttribute('autocomplete', 'new-password');
+				    data.form.appendChild(input);
+				
+				    return data;
+				});
+				EOD;
+		} else {
+			$autocomplete = RGFormsModel::is_html5_enabled() ? ".attr( 'autocomplete', 'new-password' )\n\t\t" : '';
 
-		$script = <<<EOD
-jQuery( "#gform_{$form_id}" ).on( 'submit', function( event ) {
-	jQuery( '<input>' )
-		.attr( 'type', 'hidden' )
-		.attr( 'name', 'gf_zero_spam_key' )
-		.attr( 'value', '{$spam_key}' )
-		$autocomplete.appendTo( jQuery( this ) );
-} );
-EOD;
+			$script = <<<EOD
+				jQuery( "#gform_{$form_id}" ).on( 'submit', function( event ) {
+					jQuery( '<input>' )
+						.attr( 'type', 'hidden' )
+						.attr( 'name', 'gf_zero_spam_key' )
+						.attr( 'value', '{$spam_key}' )
+						$autocomplete.appendTo( jQuery( this ) );
+				} );
+				EOD;
+		}
 
-		GFFormDisplay::add_init_script( $form['id'], 'gf-zero-spam', GFFormDisplay::ON_PAGE_RENDER, $script );
+		GFFormDisplay::add_init_script( $form_id, 'gf-zero-spam', GFFormDisplay::ON_PAGE_RENDER, $script );
 	}
 
 	/**
@@ -161,6 +176,11 @@ EOD;
 	 * @return bool True: it's spam; False: it's not spam!
 	 */
 	public function check_key_field( $is_spam = false, $form = array(), $entry = array() ) {
+
+		// If the user can edit entries, they're not a spammer. It may be spam, but it's their prerogative.
+		if ( GFCommon::current_user_can_any( 'gravityforms_edit_entries' ) ) {
+			return false;
+		}
 
 		$should_check_key_field = ! GFCommon::is_preview();
 
@@ -194,7 +214,7 @@ EOD;
 			return $is_spam;
 		}
 
-		if ( ! isset( $_POST['gf_zero_spam_key'] ) || html_entity_decode( $_POST['gf_zero_spam_key'] ) !== $this->get_key() ) {
+		if ( ! isset( $_POST['gf_zero_spam_key'] ) || html_entity_decode( sanitize_text_field( wp_unslash( $_POST['gf_zero_spam_key'] ) ) ) !== $this->get_key() ) {
 			add_action( 'gform_entry_created', array( $this, 'add_entry_note' ) );
 
 			return true;
