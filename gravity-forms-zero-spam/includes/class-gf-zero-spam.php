@@ -7,6 +7,33 @@ if ( ! defined( 'WPINC' ) ) {
 class GF_Zero_Spam {
 
 	/**
+	 * Scripts queued for output after each form.
+	 *
+	 * @since 1.7.3
+	 *
+	 * @var array<int, string> Keyed by form ID.
+	 */
+	private $pending_scripts = [];
+
+	/**
+	 * Request-local token rejection reason codes keyed by form ID.
+	 *
+	 * @since 1.9.0
+	 *
+	 * @var array<int, string>
+	 */
+	private static $token_rejections = [];
+
+	/**
+	 * Request-local non-token spam sources keyed by form ID.
+	 *
+	 * @since 1.9.0
+	 *
+	 * @var array<int, array<int, string>>
+	 */
+	private static $non_token_spam_sources = [];
+
+	/**
 	 * Instantiates the plugin on Gravity Forms loading.
 	 *
 	 * @since 1.0.5
@@ -39,6 +66,93 @@ class GF_Zero_Spam {
 	}
 
 	/**
+	 * Gets the token rejection reason code for this request.
+	 *
+	 * @since 1.9.0
+	 *
+	 * @param int $form_id The form ID.
+	 *
+	 * @return string The rejection reason code.
+	 */
+	public static function get_token_rejection_reason_code( $form_id ) {
+		$form_id = (int) $form_id;
+
+		return isset( self::$token_rejections[ $form_id ] ) ? self::$token_rejections[ $form_id ] : '';
+	}
+
+	/**
+	 * Clears the token rejection reason code for this request.
+	 *
+	 * @since 1.9.0
+	 *
+	 * @param int $form_id The form ID.
+	 *
+	 * @return void
+	 */
+	public static function clear_token_rejection_reason_code( $form_id ) {
+		unset( self::$token_rejections[ (int) $form_id ] );
+	}
+
+	/**
+	 * Resets request-local spam markers before processing a submission.
+	 *
+	 * @since 1.9.0
+	 *
+	 * @param array|null $form The form being processed when called as a filter.
+	 *
+	 * @return array|null The form being processed.
+	 */
+	public static function reset_request_markers( $form = null ) {
+		self::$token_rejections       = [];
+		self::$non_token_spam_sources = [];
+
+		return $form;
+	}
+
+	/**
+	 * Records a non-token Zero Spam spam source for this request.
+	 *
+	 * @since 1.9.0
+	 *
+	 * @param int    $form_id The form ID.
+	 * @param string $source  The non-token spam source code.
+	 *
+	 * @return void
+	 */
+	public static function record_non_token_spam_source( $form_id, $source ) {
+		$form_id = (int) $form_id;
+
+		if ( $form_id < 1 ) {
+			return;
+		}
+
+		if ( empty( self::$non_token_spam_sources[ $form_id ] ) ) {
+			self::$non_token_spam_sources[ $form_id ] = [];
+		}
+
+		$source = (string) $source;
+
+		if ( in_array( $source, self::$non_token_spam_sources[ $form_id ], true ) ) {
+			return;
+		}
+
+		self::$non_token_spam_sources[ $form_id ][] = $source;
+	}
+
+	/**
+	 * Checks whether a non-token Zero Spam spam source flagged this request.
+	 *
+	 * @since 1.9.0
+	 *
+	 * @param int $form_id The form ID.
+	 *
+	 * @return bool Whether a non-token Zero Spam spam source flagged this request.
+	 */
+	public static function has_non_token_spam_source( $form_id ) {
+		return ! empty( self::$non_token_spam_sources[ (int) $form_id ] );
+	}
+
+	/**
 	 * Constructor. Registers Gravity Forms hooks.
 	 *
 	 * @since 1.0
@@ -47,6 +161,8 @@ class GF_Zero_Spam {
 		new GF_Zero_Spam_Token_Endpoint();
 
 		add_action( 'gform_register_init_scripts', [ $this, 'add_key_field' ], 1 );
+		add_filter( 'gform_pre_process', [ __CLASS__, 'reset_request_markers' ] );
+		add_filter( 'gform_get_form_filter', [ $this, 'enqueue_script' ], 10, 2 );
 		add_filter( 'gform_entry_is_spam', [ $this, 'check_key_field' ], 10, 3 );
 		add_filter( 'gform_incomplete_submission_pre_save', [ $this, 'add_zero_spam_key_to_entry' ], 10, 3 );
 		add_filter( 'gform_abort_submission_with_confirmation', [ $this, 'maybe_abort_submission' ], 20, 2 );
@@ -167,11 +283,13 @@ class GF_Zero_Spam {
 	}
 
 	/**
-	 * Injects the hidden field and key into the form at submission.
+	 * Collects the Zero Spam configuration for a form.
+	 *
+	 * The configuration is passed to a separate JavaScript file via
+	 * wp_localize_script to avoid breaking Gravity Forms' conditional logic
+	 * if a JS optimization plugin mangles the inline script.
 	 *
 	 * @since 1.0
-	 *
-	 * @uses GFFormDisplay::add_init_script() to inject the code into the `gform_post_render` hook.
 	 *
 	 * @param array $form The Form Object.
 	 *
@@ -200,10 +318,6 @@ class GF_Zero_Spam {
 
 		$form_id = (int) $form['id'];
 
-		$fallback_token = GF_Zero_Spam_Token::mint( $form_id, DAY_IN_SECONDS );
-		$rest_url       = esc_url( rest_url( 'gf-zero-spam/v1/token' ) );
-		$ajax_url       = esc_url( admin_url( 'admin-ajax.php' ) );
-
 		/**
 		 * Filters the timeout (in milliseconds) for AJAX token fetch attempts.
 		 *
@@ -213,131 +327,100 @@ class GF_Zero_Spam {
 		 */
 		$timeout = (int) apply_filters( 'gf_zero_spam_token_fetch_timeout', 3000 );
 
-		// Embedded as a JS object literal since add_init_script doesn't use a registered script handle.
-		$config = wp_json_encode(
-            [
-				'restUrl'       => $rest_url,
-				'ajaxUrl'       => $ajax_url,
-				'fallbackToken' => $fallback_token,
-				'formId'        => $form_id,
-				'timeout'       => $timeout,
-			]
-        );
+		/**
+		 * Filters the fallback token TTL embedded in the page HTML.
+		 *
+		 * The fallback token is used when the AJAX token fetch fails.
+		 * Its TTL should exceed the longest page cache duration on the site.
+		 *
+		 * @since 1.7.3
+		 *
+		 * @param int $ttl Fallback token lifetime in seconds. Default 604800 (7 days).
+		 */
+		$fallback_ttl = (int) apply_filters( 'gf_zero_spam_fallback_token_ttl', GF_Zero_Spam_AddOn::get_instance()->get_token_ttl_seconds() );
 
-		if ( version_compare( GFForms::$version, '2.9.0', '>=' ) ) {
-			$script = <<<EOD
-				gform.utils.addAsyncFilter('gform/submission/pre_submission', async (data) => {
-				    const cfg = {$config};
+		$this->pending_scripts[ $form_id ] = [
+			'ajaxUrl'       => esc_url_raw( admin_url( 'admin-ajax.php' ) ),
+			'fallbackToken' => GF_Zero_Spam_Token::mint( $form_id, $fallback_ttl ),
+			'formId'        => $form_id,
+			'timeout'       => $timeout,
+		];
+	}
 
-				    // Only process the form this filter was registered for.
-				    if (parseInt(data.form.dataset.formid, 10) !== cfg.formId) {
-				        return data;
-				    }
-
-				    let token = cfg.fallbackToken;
-
-				    try {
-				        const ctrl = new AbortController();
-				        const timer = setTimeout(() => ctrl.abort(), cfg.timeout);
-				        const res = await fetch(cfg.restUrl + '?form_id=' + cfg.formId, { signal: ctrl.signal });
-
-				        clearTimeout(timer);
-
-				        if (res.ok) {
-				            const json = await res.json();
-				            token = json.token;
-				        } else {
-				            throw new Error('REST failed');
-				        }
-				    } catch (e) {
-				        try {
-				            const ctrl2 = new AbortController();
-				            const timer2 = setTimeout(() => ctrl2.abort(), cfg.timeout);
-				            const res2 = await fetch(cfg.ajaxUrl + '?action=gf_zero_spam_token&form_id=' + cfg.formId, { signal: ctrl2.signal });
-
-				            clearTimeout(timer2);
-
-				            if (res2.ok) {
-				                const json2 = await res2.json();
-				                token = json2.token;
-				            }
-				        } catch (e2) {
-				            // Both endpoints failed; use fallback token.
-				        }
-				    }
-
-				    const old = data.form.querySelector('input[name="gf_zero_spam_token"]');
-				    if (old) { old.remove(); }
-
-				    const input = document.createElement('input');
-				    input.type = 'hidden';
-				    input.name = 'gf_zero_spam_token';
-				    input.value = token;
-				    input.setAttribute('autocomplete', 'new-password');
-				    data.form.appendChild(input);
-
-				    return data;
-				});
-EOD;
-		} else {
-			$script = <<<EOD
-				const gfzsForm = document.getElementById('gform_{$form_id}');
-
-				if (gfzsForm && !gfzsForm.dataset.gfzsBound) {
-				    gfzsForm.dataset.gfzsBound = '1';
-				    gfzsForm.addEventListener('submit', async function(e) {
-				        e.preventDefault();
-
-				        const cfg = {$config};
-				        let token = cfg.fallbackToken;
-
-				        try {
-				            const ctrl = new AbortController();
-				            const timer = setTimeout(() => ctrl.abort(), cfg.timeout);
-				            const res = await fetch(cfg.restUrl + '?form_id=' + cfg.formId, { signal: ctrl.signal });
-
-				            clearTimeout(timer);
-
-				            if (res.ok) {
-				                const json = await res.json();
-				                token = json.token;
-				            } else {
-				                throw new Error('REST failed');
-				            }
-				        } catch (e1) {
-				            try {
-				                const ctrl2 = new AbortController();
-				                const timer2 = setTimeout(() => ctrl2.abort(), cfg.timeout);
-				                const res2 = await fetch(cfg.ajaxUrl + '?action=gf_zero_spam_token&form_id=' + cfg.formId, { signal: ctrl2.signal });
-
-				                clearTimeout(timer2);
-
-				                if (res2.ok) {
-				                    const json2 = await res2.json();
-				                    token = json2.token;
-				                }
-				            } catch (e2) {
-				                // Both endpoints failed; use fallback token.
-				            }
-				        }
-
-				        const old = this.querySelector('input[name="gf_zero_spam_token"]');
-				        if (old) { old.remove(); }
-
-				        const input = document.createElement('input');
-				        input.type = 'hidden';
-				        input.name = 'gf_zero_spam_token';
-				        input.value = token;
-				        input.setAttribute('autocomplete', 'new-password');
-				        this.appendChild(input);
-
-				        this.submit();
-				    });
-				}
-EOD;
+	/**
+	 * Enqueues the Zero Spam script with collected form configurations.
+	 *
+	 * Uses a separate JavaScript file loaded after Gravity Forms' scripts so
+	 * that any error does not prevent conditional logic from executing, which
+	 * would leave the form hidden with display:none.
+	 *
+	 * @since 1.7.3
+	 *
+	 * @param string $form_string The form HTML.
+	 * @param array  $form        The Form Object.
+	 *
+	 * @return string The unmodified form HTML.
+	 */
+	public function enqueue_script( $form_string, $form ) {
+		if ( empty( $this->pending_scripts ) ) {
+			return $form_string;
 		}
 
-		GFFormDisplay::add_init_script( $form_id, 'gf-zero-spam', GFFormDisplay::ON_PAGE_RENDER, $script );
+		if ( wp_script_is( 'gf-zero-spam', 'enqueued' ) ) {
+			return $form_string;
+		}
+
+		$handle = version_compare( GFForms::$version, '2.9.0', '>=' )
+			? 'gform_gravityforms_utils'
+			: 'gform_gravityforms';
+
+		wp_enqueue_script(
+			'gf-zero-spam',
+			plugins_url( 'dist/js/gf-zero-spam.js', GF_ZERO_SPAM_FILE ),
+			[ $handle ],
+			(string) @filemtime( GF_ZERO_SPAM_DIR . 'dist/js/gf-zero-spam.js' ), // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- Graceful fallback when file is missing.
+			true
+		);
+
+		// Inject the config at print time via script_loader_tag rather than
+		// wp_localize_script in a wp_footer callback. This guarantees all forms
+		// have been collected because script_loader_tag fires during
+		// wp_print_footer_scripts (wp_footer priority 20), after themes and
+		// plugins that render forms via wp_footer at default priority.
+		add_filter( 'script_loader_tag', [ $this, 'inject_config' ], 10, 2 );
+
+		return $form_string;
+	}
+
+	/**
+	 * Injects the form configuration inline before the Zero Spam script tag.
+	 *
+	 * Uses script_loader_tag instead of wp_localize_script so the config is
+	 * built at print time, after all forms on the page (including those
+	 * rendered via wp_footer by themes and plugins) have been collected.
+	 *
+	 * @since 1.7.5
+	 *
+	 * @param string $tag    The script tag HTML.
+	 * @param string $handle The script handle.
+	 *
+	 * @return string The (possibly modified) script tag HTML.
+	 */
+	public function inject_config( $tag, $handle ) {
+		if ( 'gf-zero-spam' !== $handle || empty( $this->pending_scripts ) ) {
+			return $tag;
+		}
+
+		$config = wp_json_encode(
+			[
+				'forms' => array_values( $this->pending_scripts ),
+				'debug' => defined( 'WP_DEBUG' ) && WP_DEBUG,
+			]
+		);
+
+		$inline = sprintf( "<script type='text/javascript'>var gfZeroSpamConfig = %s;</script>\n", $config );
+
+		return $inline . $tag;
 	}
 
 	/**
@@ -412,7 +495,8 @@ EOD;
 				'sig_invalid'   => __( 'The spam prevention token signature is invalid.', 'gravity-forms-zero-spam' ),
 			];
 
-			$reason = isset( $reason_map[ $result['reason'] ] ) ? $reason_map[ $result['reason'] ] : $result['reason'];
+			$reason_code = (string) $result['reason'];
+			$reason      = isset( $reason_map[ $reason_code ] ) ? $reason_map[ $reason_code ] : $reason_code;
 
 			if ( method_exists( 'GFCommon', 'set_spam_filter' ) ) {
 				GFCommon::set_spam_filter( rgar( $form, 'id' ), 'Zero Spam', $reason );
@@ -420,22 +504,27 @@ EOD;
 				add_action( 'gform_entry_created', [ $this, 'add_entry_note' ] );
 			}
 
+			$this->record_token_rejection( $reason_code, $form, $entry, __METHOD__ );
+
 			return true;
 		}
 
 		// Fall back to legacy static key during migration.
 		$submitted_key = rgpost( 'gf_zero_spam_key' );
 		$reason        = '';
+		$reason_code   = '';
 
 		if ( rgblank( $submitted_key ) ) {
-			$is_spam = true;
-			$reason  = __( 'The submission did not include a spam prevention token.', 'gravity-forms-zero-spam' );
+			$is_spam     = true;
+			$reason      = __( 'The submission did not include a spam prevention token.', 'gravity-forms-zero-spam' );
+			$reason_code = 'legacy_missing';
 		} else {
 			$legacy_result = $this->validate_legacy_key( $submitted_key );
 
 			if ( true !== $legacy_result ) {
-				$is_spam = true;
-				$reason  = $legacy_result;
+				$is_spam     = true;
+				$reason      = $legacy_result;
+				$reason_code = 'legacy_invalid';
 			}
 		}
 
@@ -449,7 +538,40 @@ EOD;
 			add_action( 'gform_entry_created', [ $this, 'add_entry_note' ] );
 		}
 
+		$this->record_token_rejection( $reason_code, $form, $entry, __METHOD__ );
+
 		return $is_spam;
+	}
+
+	/**
+	 * Records a rejected token check for diagnostics.
+	 *
+	 * @since 1.9.0
+	 *
+	 * @param string $reason_code Raw rejection reason code.
+	 * @param array  $form        The form currently being processed.
+	 * @param array  $entry       The pre-save entry currently being processed.
+	 * @param string $method      The method that rejected the token.
+	 *
+	 * @return void
+	 */
+	private function record_token_rejection( $reason_code, $form, $entry, $method ) {
+		self::$token_rejections[ (int) rgar( $form, 'id' ) ] = (string) $reason_code;
+
+		if ( method_exists( 'GF_Zero_Spam_AddOn', 'get_instance' ) ) {
+			GF_Zero_Spam_AddOn::get_instance()->log_debug( $method . '(): Submission rejected by Zero Spam token check. Reason: ' . $reason_code . '. Form #' . (int) rgar( $form, 'id' ) . '.' );
+		}
+
+		/**
+		 * Fires when a submission is rejected by the Zero Spam token check.
+		 *
+		 * @since 1.9.0
+		 *
+		 * @param string $reason_code Raw rejection reason code. Accepted values: token_missing, bad_format, expired, form_mismatch, sig_invalid, legacy_missing, legacy_invalid.
+		 * @param array  $form        The form currently being processed.
+		 * @param array  $entry       The entry currently being processed. Note: pre-save entry; no ID yet.
+		 */
+		do_action( 'gf_zero_spam_token_rejected', $reason_code, $form, $entry );
 	}
 
 	/**
